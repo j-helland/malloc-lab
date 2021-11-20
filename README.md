@@ -5,6 +5,8 @@ Provides `malloc`, `free`, `calloc`, and `realloc` implementations.
 
 An experimental branch using splay-trees for managing certain memory blocks is also available.
 
+I had a lot of fun working on this, especially once I started thinking about adaptive data structures like splay trees for specializing malloc towards specific usage patterns.
+
 ### **WARNING**
 This code will not compile as-is. It was written to interface with a larger test harness that includes memory emulation. In particular, the heap is simulated e.g. functions like `mem_sbrk` exist in place of standard `sbrk`.
 Descriptions of these functions are provided in [`memlib.h`](./memlib.h), which should provide enough context to port this code to the canonical C UNIX functions if desired.
