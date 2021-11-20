@@ -1,133 +1,7 @@
 /**
  * @author Jonathan Helland
  * @file mm.c
- * @brief A 64-bit struct-based segmented free list memory allocator.
- *
- * 15-213: Introduction to Computer Systems
- *
- **************** ORGANIZATION
- * The code is organized into the follow sections:
- *
- * 1. Constants, structs, globals, etc.
- *
- * 2. Helper functions. These operate on a specific subcomponent of the heap
- *    e.g. seglist_insert.
- *   a. Math & misc b. Get data: access metadata from a block.
- *   c. Set data: write metadata to a block.
- *   d. Basic search: find blocks matching various specifications.
- *   e. Freelist helpers: functions that interact exclusively with an
- *      individual freelist data structure.
- *   f. Seglist helpers: functions that interact with the entire segmented
- *      list data structure.
- *
- * 3. Primary heap routines. These operate on the entire heap in some way e.g.
- *    mm_malloc, mm_free.
- *
- * 4. Debugging functions. These include heap checker functions and printing
- *    functions that are handy in gdb e.g. print_heap.
- *
- **************** DOCUMENTATION
- * OVERVIEW
- * This malloc implementation organizes blocks according to their sizes via a
- * segregated list. The segregated list itself contains bins corresponding to
- * "small" blocks and "large" blocks. Blocks within a small bin all have the
- * same size and are strung together by a singly-linked, list - this
- * means that minimal overhead is required. Large bins contain blocks of varying
- * sizes within some pre-determined range and are thus connected together via a
- * doubly-linked, circular list. By reserving this overhead only for larger
- * blocks, we minimize wasted space since a sufficiently large block will
- * already have enough capacity in its payload for the next/prev list pointers.
- *
- * Pictorially, the segregated list has the following bin structure:
- *  ---- ---- ----       ---- -----       -------
- * | 16 | 32 | 40 | ... | 64 | 128 | ... | 16384 |
- *  ---- ---- ----       ---- -----       -------
- * small <-----------------large---------------->
- *
- * Even though only the first bin is marked as "small", the size 32 bin is de
- * facto small as well due to the 16-byte address alignment requirement. We
- * could actually do much better in terms of utilization if we removed the
- * alignment constraint for small bins - there are many 24 byte allocations, for
- * example. However, the alignment requirement of this assignment means that it
- * only makes sense to have a single small bin.
- *
- * Starting at bin size 32, we increase in size by increments of 8 up to size
- * 64, at which point we begin doubling the bin size at each step. This is
- * because of the roughly power-law distributed allocation sizes that we see in
- * practice across all traces. We want to have a fairly fine level of
- * granularity for small bins, whereas larger allocation sizes will occur
- * relatively rarely.
- *
- * Within the small bin, the blocks follow a typical singly-linked list
- * structure. Each node has one size.
- * Our insertion policy here is at the head i.e. O(1). Removal can happen
- * anywhere i.e. O(n).
- *  ----      ----             ----
- * | 16 | -> | 16 | -> ... -> | 16 | -> NULL
- *  ----      ----             ----
- *
- * The large bins are doubly linked and circular. Each node has a varying size.
- * The circularity is an implementation convenience - it allows for fewer
- * global variables if we want to do things like tail insertion.
- * Our insertion policy is slightly more complicated here:
- * - If a block is small enough, we insert at the head.
- * - If a block is large enough, we insert at the tail.
- * Experimentally, I found that head insertion for the 32-64 sized bins and
- * tail insertion for the 128-16384 sized bins performs pretty well in terms of
- * throughput while not sacrificing too much utilization.
- *           ----       ----               ----
- * tail <-> |    | <-> |    | <-> ... <-> |    | <-> head
- *           ----       ----               ----
- *           head                          tail
- *
- * To find a block fit when calling malloc, I use a first-fit policy. Starting
- * at the smallest bin size with sufficient capacity for the request, the
- * search traverses through the freelist starting at the head, moving up to
- * the next bin if no match is found.
- *
- * Upon finding a match, we split the block down to the requested size (plus
- * overhead), adding the split off block back into the seglist.
- *
- * O(1) coalescing is implemented with an immediate-coalesce policy, meaning
- * that we coalesce immediately upon a free operation.
- *
- *
- * OPTIMIZATIONS
- * Here I describe in a bulleted fashion the most significant performance
- * improvements. Much of this information is contained in the above
- * overview of the system.
- *
- * - Segmented list of freelists. This approximates a best fit policy well
- *   enough that we can get away with a fast first-fit policy for finding
- *   free blocks. This improves both utilization and throughput.
- *
- * - No footers for small blocks, instead we use a bit in the header that
- *   indicates the allocations status of the previous block. This improves
- *   utilization.
- *
- * - Singly linked list for small blocks i.e. only the header and one
- *   next pointer. This improves utilization.
- *
- * - A mixture of LIFO and FIFO insertion policies in large bins depending
- *   on the size of the bin. This increases throughput with a negligible
- *   decrease in utilization.
- *
- * FUTURE IMPROVEMENTS
- * - In theory, a search tree would help with utilization for bins that
- *   have high entropy in their distribution of block sizes. This tends
- *   to be the case for the largest bins (recall that the allocation
- *   sizes tend to follow a power-law distribution and the large bins
- *   exist in the tail regime of this distribution). This would allow
- *   an efficient best-fit policy for these bins.
- *
- * FAILED EXPERIMENTS
- * - Splay trees to order blocks by size did not seem to help. In fact,
- *   utilization did not seem to improve while throughput significantly
- *   decreased. I suspect this was due to the overhead of the splay
- *   operation after every insertion and deletion.
- *   Note: I used a best-fit policy for the splay tree.
- *
- *************************************************************************
+ * @brief A 64-bit struct-based implicit free list memory allocator.
  */
 
 #include <assert.h>
@@ -142,6 +16,7 @@
 
 #include "memlib.h"
 #include "mm.h"
+#include "splay.h"
 
 #ifdef DEBUG
 /* When DEBUG is defined, these form aliases to useful functions */
@@ -223,23 +98,26 @@ static const word_t size_mask = ~(word_t)0xF;
  *
  * @param  header   Contains the size and allocation status (lowest bit) of the
  * block.
- * @param  next     Pointer to the next block in the freelist. Note that this
- * pointer is used for both large and small blocks.
- * @param  prev     Pointer to the previous block in the freelist.
  * @param  payload  Pointer to the actual payload of the block.
  */
 typedef struct block block_t;
 struct block {
-    // Header contains size + allocation + prev_alloc + prev_small bits.
+    /** @brief Header contains size + allocation flag */
     word_t header;
 
+    /** @brief A pointer to the block payload. */
     union {
         // Linked list overhead.
         struct {
             block_t *next;
             block_t *prev;
         };
-        // A pointer to the block payload.
+        // Splay tree overhead.
+        struct {
+            block_t *left;
+            block_t *right;
+            block_t *next_dup;
+        };
         char payload[0];
     };
 };
@@ -252,11 +130,13 @@ static const size_t hoffset = hsize - 1;
 
 /** @brief Metadata about the configuration of the seglist. Small bins are those
  * which only use a next pointer rather than next/prev pointers and a footer. We
- * can easily allow multiple block sizes like this if we so desire. */
+ * can easily multiple block sizes like this if we so desire. */
 static const size_t seglist_size = 15;
 static const size_t seglist_small_bins = 0; // Bins up to this one are small.
+static const size_t seglist_splay_bins = 14;  // Bins including and beyond
+// this one are splayed.
 static const size_t seglist_bin_sizes[seglist_size - 1] = {
-    min_block_size, 32,   40,   48,   56,   64, 128, 256, 512,
+    min_block_size, 24,   32,   40,   48,   56, 128, 256, 512,
     1024,           2048, 4096, 8192, 16384};
 
 /**
@@ -265,7 +145,7 @@ static const size_t seglist_bin_sizes[seglist_size - 1] = {
  *
  * I selected this value through multiple benchmarking sessions.
  */
-static const size_t seglist_fifo_insertion_threshold = 6;
+static const size_t seglist_fifo_insertion_threshold = 5;
 
 /*********** Global variables ***********/
 
@@ -283,11 +163,10 @@ static block_t *find_next(block_t *block);
 static void freelist_insert(block_t *block, const size_t bin);
 static size_t seglist_find_bin(block_t *block);
 static size_t seglist_find_bin_from_size(size_t size);
-extern bool mm_checkheap(int line);
 
 /*
  * ---------------------------------------------------------------------------
- *                        BEGIN HELPER FUNCTIONS
+ *                        BEGIN SHORT HELPER FUNCTIONS
  * ---------------------------------------------------------------------------
  */
 
@@ -563,8 +442,8 @@ static void write_block(block_t *block, size_t size, bool alloc) {
 
     // State to update / preserve.
     bool small = (size == min_block_size);
-    bool prev_small = get_prev_small(block);
     bool prev_alloc = get_prev_alloc(block);
+    bool prev_small = get_prev_small(block);
 
     block->header = pack(size, alloc);
 
@@ -634,8 +513,7 @@ static block_t *find_prev(block_t *block) {
 
     // Need to handle small blocks differently because we don't have a footer to
     // use. In this case, we assume fixed block size.
-    size_t small = get_prev_small(block);
-    if (small)
+    if (get_prev_small(block))
         return (block_t *)(&(block->header) - (min_block_size / wsize));
 
     word_t *footerp = find_prev_footer(block);
@@ -750,6 +628,27 @@ static void freelist_set_prev(block_t *block, block_t *prev) {
 }
 
 /**
+ * @brief Print a representation of the freelist.
+ *
+ * Only for debugging purposes.
+ *
+ * @param[in]  head  Pointer to the head of the freelist to print.
+ */
+void print_freelist(block_t *head) {
+    block_t *b = head;
+    bool looped = false;
+    while (!looped && b != NULL) {
+        if (b)
+            printf("%p (%lu) (%lu) <-> ", b, seglist_find_bin(b), get_size(b));
+        else
+            printf("NULL <-> ");
+
+        b = freelist_find_next(b);
+        looped = (b == head);
+    }
+}
+
+/**
  * @brief Remove a block from the freelist.
  *
  * @param[out]  block  Pointer to the block to remove. Must exist in the
@@ -762,7 +661,6 @@ static void freelist_remove(block_t *block, const size_t bin) {
     dbg_requires(get_size(block));
 
     // Small block case.
-    // Singly linked list deletion.
     if (bin <= seglist_small_bins) {
         if (block == seglist_heads[bin]) {
             seglist_heads[bin] = freelist_find_next(block);
@@ -772,16 +670,14 @@ static void freelist_remove(block_t *block, const size_t bin) {
         block_t *prev = seglist_heads[bin];
         for (; freelist_find_next(prev) != block;
              prev = freelist_find_next(prev))
-            ; // wow that's ugly, thanks clang formatting
+            ;
         freelist_set_next(prev, freelist_find_next(block));
 
         return;
     }
 
-    // Large block case.
-    // Doubly linked list deletion.
+    // Special case: freelist becomes empty.
     if (freelist_find_next(block) == block) {
-        // Special case: freelist becomes empty.
         seglist_heads[bin] = NULL;
 
     } else {
@@ -792,8 +688,9 @@ static void freelist_remove(block_t *block, const size_t bin) {
         freelist_set_prev(next, prev);
 
         // If block was on the boundary, update the circular edge.
-        if (block == seglist_heads[bin])
+        if (block == seglist_heads[bin]) {
             seglist_heads[bin] = next;
+        }
     }
 
     dbg_ensures(!is_block_in_freelist(block, seglist_heads[bin]));
@@ -805,6 +702,8 @@ static void freelist_remove(block_t *block, const size_t bin) {
  * We insert larger blocks at the end of the list and smaller blocks at the
  * beginning. Assuming a first-fit policy, this will improve utilization
  * slightly by very crudely approximating a best fit policy.
+ *
+ * @todo Address-ordered policy
  *
  * @param[out]  block  Pointer to the block to insert. Must not exist in the
  * freelist already.
@@ -846,7 +745,10 @@ static void freelist_insert(block_t *block, const size_t bin) {
 
     // ---------- FIFO insertion: insert at end of list.
     // If the block size is large enough, then place at the end of the bin's
-    // freelist.
+    // freelist. This is a very crude proxy for sorting, which will
+    // increase utilization ever so slightly.
+    // @note We could instead place larger blocks at the beginning to promote
+    // higher throughput.
     if (bin > seglist_fifo_insertion_threshold) {
         block_t *tail_orig = freelist_find_prev(seglist_heads[bin]);
 
@@ -874,22 +776,283 @@ static void freelist_insert(block_t *block, const size_t bin) {
     dbg_ensures(is_block_in_freelist(block, seglist_heads[bin]));
 }
 
+/*********** Splay tree helpers ***********/
+
+/**
+* @todo
+*/
+bool is_block_in_splaytree(block_t *block, block_t *tree) {
+   if (tree == NULL)
+       return false;
+
+   // Search linked list of duplicates for a match.
+   for (block_t *b = tree; b != NULL; b = b->next_dup)
+       if (b == block)
+           return true;
+
+   // Search subtrees for a match.
+   return is_block_in_splaytree(block, tree->left) ||
+   is_block_in_splaytree(block, tree->right);
+}
+
+/**
+* @todo
+*/
+void print_splaytree(block_t *tree) {
+   if (tree == NULL)
+       return;
+
+   printf("(");
+   for (block_t *b = tree; b != NULL; b = b->next_dup)
+       printf("%p:%lu,", b, get_size(b));
+   printf(" l");
+
+   print_splaytree(tree->left);
+   printf(" r");
+   print_splaytree(tree->right);
+   printf(")");
+}
+
+/**
+* @todo
+*/
+void splaytree_splay(size_t size, size_t bin, block_t *block, block_t *tree)
+{
+   if (tree == NULL)
+       return;
+
+   block_t node, *left, *right, *y;
+   node.left = node.right = NULL;
+   left = right = &node;
+
+   // Early out: desired block is already the root.
+   if (block == tree)
+       return;
+
+   while (true) {
+       size_t root_size = get_size(tree);
+       if (size < root_size) {
+           if (tree->left == NULL)
+               break;
+
+           // Rotate right.
+           size_t left_size = get_size(tree->left);
+           if (size < left_size) {
+               y = tree->left;
+               tree->left = y->right;
+               y->right = tree;
+               tree = y;
+
+               if (tree->left == NULL)
+                   break;
+           }
+
+           // Link right.
+           right->left = tree;
+           right = tree;
+           tree = tree->left;
+
+       } else if (size > root_size) {
+           if (tree->right == NULL)
+               break;
+
+           // Rotate left.
+           size_t right_size = get_size(tree->right);
+           if (size > right_size) {
+               y = tree->right;
+               tree->right = y->left;
+               y->left = tree;
+               tree = y;
+
+               if (tree->right == NULL)
+                   break;
+           }
+
+           // Link left.
+           left->right = tree;
+           left = tree;
+           tree = tree->right;
+
+       } else {
+           break;
+       }
+   }
+
+   // Assemble.
+   left->right = tree->left;
+   right->left = tree->right;
+   tree->left = node.right;
+   tree->right = node.left;
+
+   //return tree;
+   seglist_heads[bin] = tree;
+}
+
+/**
+* @todo
+*/
+void splaytree_insert(block_t *block, size_t bin) {
+   dbg_requires(block != NULL);
+   dbg_requires(!get_alloc(block));
+   dbg_requires(get_size(block));
+   dbg_requires(!is_block_in_splaytree(block, seglist_heads[bin]));
+   dbg_requires(bin >= seglist_splay_bins);
+
+   size_t size = get_size(block);
+   block_t *tree = seglist_heads[bin];
+
+   // Empty tree case.
+   if (tree == NULL) {
+       block->left = block->right = block->next_dup = NULL;
+       seglist_heads[bin] = block;
+       return;
+   }
+
+   splaytree_splay(get_size(block), bin, block, tree);
+   tree = seglist_heads[bin];
+   size_t root_size = get_size(tree);
+
+   if (size < root_size) {
+       block->left = tree->left;
+       block->right = tree;
+       tree->left = block->next_dup = NULL;
+       seglist_heads[bin] = block;
+       return;
+
+   } else if (size > root_size) {
+       block->right = tree->right;
+       block->left = tree;
+       tree->right = block->next_dup = NULL;
+       seglist_heads[bin] = block;
+       return;
+
+   } else {
+       // Extend the duplicates list by inserting at the head of the list.
+       block->right = tree->right;
+       block->left = tree->left;
+       tree->right = tree->left = NULL;
+       block->next_dup = tree;
+       seglist_heads[bin] = block;
+   }
+}
+
+/**
+* @todo
+*/
+void splaytree_remove(block_t *block, size_t bin) {
+   dbg_requires(block != NULL);
+   dbg_requires(!get_alloc(block));
+   dbg_requires(get_size(block));
+   dbg_requires(is_block_in_splaytree(block, seglist_heads[bin]));
+   dbg_requires(bin >= seglist_splay_bins);
+
+   block_t *tree = seglist_heads[bin];
+   dbg_requires(tree != NULL);
+
+   splaytree_splay(get_size(block), bin, block, tree);
+   tree = seglist_heads[bin];
+   dbg_ensures(get_size(tree) == get_size(block));
+
+   block_t *b = tree;
+   // Duplicate nodes exist.
+   if (b->next_dup != NULL) {
+       // Target node is the head.
+       if (b == block) {
+           seglist_heads[bin] = b->next_dup;
+           seglist_heads[bin]->right = block->right;
+           seglist_heads[bin]->left = block->left;
+           return;
+       }
+
+       // Find the previous node to the target block.
+       for (; b->next_dup != block && b != NULL; b = b->next_dup);
+       b->next_dup = block->next_dup;
+
+   // No duplicates exist.
+   } else {
+       if (tree->left == NULL) {
+           seglist_heads[bin] = tree->right;
+       } else {
+           splaytree_splay(get_size(block), bin, block, tree->left);
+           seglist_heads[bin]->right = tree->right;
+       }
+   }
+}
+
+/**
+* @todo
+*/
+block_t *splaytree_find_fit_recursive(size_t size, block_t *tree) {
+   if (tree == NULL)
+       return tree;
+
+   if (get_size(tree) >= size) {
+       if (tree->left == NULL || get_size(tree->left) < size)
+           return tree;
+
+       return splaytree_find_fit_recursive(size, tree->left);
+   } else {
+       return splaytree_find_fit_recursive(size, tree->right);
+   }
+}
+
+block_t *splaytree_find_fit(size_t size, size_t bin) {
+   block_t *tree = seglist_heads[bin];
+   return splaytree_find_fit_recursive(size, tree);
+}
+
 /*********** Seglist helpers ***********/
+
+/**
+ * @brief Print a representation of the seglist.
+ *
+ * Only for debugging purposes.
+ *
+ * @note Calls print_freelist implicitly.
+ */
+void print_seglist(void) {
+    printf("\n");
+    for (size_t bin = 0; bin < seglist_size; ++bin) {
+        if (bin <= seglist_small_bins)
+            printf("(small) ");
+        else if (bin >= seglist_splay_bins)
+           printf("(splay) ");
+        else
+            printf("(  seg) ");
+
+        printf("bin %lu (%lu):\t", bin,
+               (bin < seglist_size - 1) ? seglist_bin_sizes[bin] : SIZE_MAX);
+
+        if (bin >= seglist_splay_bins)
+           print_splaytree(seglist_heads[bin]);
+        else
+            print_freelist(seglist_heads[bin]);
+        printf("\n");
+    }
+}
 
 /**
  * @brief Find the bin index associated with a given size.
  *
- * @param[in]  size  Size to map to a bin index.
+ * @param[in]  size
  * @return Index into the seglist.
  */
 static size_t seglist_find_bin_from_size(size_t size) {
     dbg_requires(seglist_size);
 
     size_t bin = 0;
-    for (; bin < seglist_size - 1; ++bin)
-        if (size <= seglist_bin_sizes[bin])
-            return bin;
+    for (; bin < seglist_size - 1; ++bin) {
+        // Small bins.
+        if (bin <= seglist_small_bins) {
+            if (size == seglist_bin_sizes[bin])
+                return bin;
 
+            // Large bins.
+        } else {
+            if (size <= seglist_bin_sizes[bin])
+                return bin;
+        }
+    }
     return bin; // Return last bin index
 }
 
@@ -920,6 +1083,11 @@ static size_t seglist_find_bin(block_t *block) {
  */
 static bool is_block_in_seglist(block_t *block) {
     const size_t bin = seglist_find_bin(block);
+    // Splay tree search.
+    if (bin >= seglist_splay_bins)
+       return is_block_in_splaytree(block, seglist_heads[bin]);
+
+    // Freelist search.
     return is_block_in_freelist(block, seglist_heads[bin]);
 }
 
@@ -935,7 +1103,10 @@ static void seglist_insert(block_t *block) {
     dbg_requires(!is_block_in_seglist(block));
 
     const size_t bin = seglist_find_bin(block);
-    freelist_insert(block, bin);
+    if (bin >= seglist_splay_bins)
+       splaytree_insert(block, bin);
+    else
+        freelist_insert(block, bin);
 }
 
 /**
@@ -950,14 +1121,19 @@ static void seglist_remove(block_t *block) {
     dbg_requires(is_block_in_seglist(block));
 
     const size_t bin = seglist_find_bin(block);
-    freelist_remove(block, bin);
+    if (bin >= seglist_splay_bins)
+       splaytree_remove(block, bin);
+    else
+        freelist_remove(block, bin);
 }
 
 /*
  * ---------------------------------------------------------------------------
- *                        END HELPER FUNCTIONS
+ *                        END SHORT HELPER FUNCTIONS
  * ---------------------------------------------------------------------------
  */
+
+/******** The remaining content below are helper and debug routines ********/
 
 /**
  * @brief Given a pointer to a free block, inspect its left and right neighbors
@@ -1101,18 +1277,467 @@ static block_t *find_fit(size_t asize) {
     for (size_t bin = seglist_find_bin_from_size(asize); bin < seglist_size;
          ++bin) {
 
-        block_t *b = seglist_heads[bin];
-        bool looped = false;
-        while (!looped && b != NULL) {
-            // First-fit policy
-            if (asize <= get_size(b))
-                return b;
+        // Splaytree search in large bins.
+        if (bin >= seglist_splay_bins) {
+           block_t *b = splaytree_find_fit(asize, bin);
+           if (b != NULL)
+               return b;
 
-            b = freelist_find_next(b);
-            looped = (b == seglist_heads[bin]);
+           // Freelist search in small bins.
+        } else {
+            block_t *b = seglist_heads[bin];
+            bool looped = false;
+            while (!looped && b != NULL) {
+                // First-fit policy
+                if (asize <= get_size(b))
+                    return b;
+
+                b = freelist_find_next(b);
+                looped = (b == seglist_heads[bin]);
+            }
         }
     }
+
     return NULL; // no fit found
+}
+
+/**
+ * @brief Check a block in the implicit list and return a code indicating its
+ * status.
+ *
+ * Corresponding codes are returned depending on which (if any) of the required
+ * conditions are violated. See `implicit_list_checker` for more details.
+ *
+ * @param[in]  block  Pointer to the block to check.
+ * @return Code BLOCK_VALID (zero-value) if no error is detected. Otherwise, a
+ * nonzero value code is returned indicating the detected error.
+ */
+code_t check_block_validity(block_t *block) {
+    code_t code = BLOCK_VALID;
+
+    if ((word_t)header_to_payload(block) % dsize)
+        code |= ADDRESS_ALIGNMENT_ERROR;
+
+    if (ptou(block) < ptou(mem_heap_lo()) ||
+        ptou(block) > ptou(mem_heap_hi() - hoffset))
+        code |= OUT_OF_BOUNDS_ERROR;
+
+    if (get_size(block) < min_block_size)
+        code |= SIZE_ERROR;
+
+    return code;
+}
+
+/**
+ * @brief Check that the implicit list of the heap is consistent.
+ *
+ * Will check the following:
+ * - That the payload address is aligned properly.
+ * - That the block address is within heap bounds.
+ * - That the block is at least as big as `min_block_size`.
+ * - That the header and footer are consistent.
+ *
+ * @param[in]  line     Line number from which mm_checkheap was called.
+ * @param[in]  n_calls  Number of times that mm_checkheap has been called prior
+ * to this time.
+ * @return HEAP_VALID (true) if no error is detected, HEAP_INVALID (false)
+ * otherwise.
+ */
+bool implicit_list_checker(int line, size_t n_calls) {
+    bool ret_code = HEAP_VALID;
+    size_t block_idx = 0;
+    bool alloc_prev = true;
+    bool small_prev = true;
+
+    for (block_t *block = heap_start; get_size(block) > 0;
+         block = find_next(block)) {
+        // Check if block is valid.
+        code_t code = check_block_validity(block);
+        if (code & ADDRESS_ALIGNMENT_ERROR) {
+            fprintf(stderr,
+                    "[implicit] (heapcheck %lu) (line %i) (block %p) Address "
+                    "misalignment %p.\n",
+                    n_calls, line, block, header_to_payload(block));
+            ret_code = HEAP_INVALID;
+        }
+        if (code & OUT_OF_BOUNDS_ERROR) {
+            fprintf(stderr,
+                    "[implicit] (heapcheck %lu) (line %i) (block %p) Block "
+                    "out of heap bounds.\n",
+                    n_calls, line, block);
+            ret_code = HEAP_INVALID;
+        }
+        if (code & SIZE_ERROR) {
+            fprintf(stderr,
+                    "[implicit] (heapcheck %lu) (line %i) (block %p) Size %lu "
+                    "is smaller than minimum required block size %lu\n",
+                    n_calls, line, block, get_size(block), min_block_size);
+            ret_code = HEAP_INVALID;
+        }
+
+        // Check that prev_alloc bit is correct.
+        if (block_idx && alloc_prev != get_prev_alloc(block)) {
+            fprintf(
+                stderr,
+                "[implicit] (heapcheck %lu) (line %i) (block %p) Inconsistent "
+                "prev_alloc bit (blocks %lu, %lu).\n",
+                n_calls, line, block, block_idx - 1, block_idx);
+            ret_code = HEAP_INVALID;
+        }
+
+        // Check that prev_small bit is correct.
+        if (block_idx && small_prev != get_prev_small(block)) {
+            fprintf(
+                stderr,
+                "[implicit] (heapcheck %lu) (line %i) (block %p) Inconsistent "
+                "prev_small bit (blocks %lu, %lu).\n",
+                n_calls, line, block, block_idx - 1, block_idx);
+            ret_code = HEAP_INVALID;
+        }
+
+        // Coalescing check.
+        if (block_idx && !alloc_prev && !get_alloc(block)) {
+            fprintf(
+                stderr,
+                "[implicit] (heapcheck %lu) (line %i) (block %p) Coalesce "
+                "failed -- found consecutive free blocks (blocks %lu, %lu).\n",
+                n_calls, line, block, block_idx - 1, block_idx);
+            ret_code = HEAP_INVALID;
+        }
+
+        // Update loop variables.
+        block_idx++;
+        alloc_prev = get_alloc(block);
+        small_prev = (get_size(block) <= seglist_bin_sizes[seglist_small_bins]);
+    }
+
+    return ret_code;
+}
+
+/**
+ * @brief Check the blocks in the explicit freelist for consistency.
+ *
+ * The following conditions are checked:
+ * - All blocks are marked as free.
+ * - The next/prev pointers are consistent i.e. the prev pointer of the next
+ * block is a pointer to this block.
+ * - The addresses of all free blocks are within bounds.
+ *
+ * @param[in]  line     Line number from which mm_checkheap was called.
+ * @param[in]  n_calls  Number of times that mm_checkheap was called prior to
+ * this time.
+ * @return HEAP_VALID (true) if no errors detected, HEAP_INVALID (false)
+ * otherwise.
+ */
+static bool explicit_list_checker(int line, size_t n_calls, block_t *head) {
+    bool ret_code = HEAP_VALID;
+    bool looped = false;
+    block_t *block = head;
+
+    while (!looped && block != NULL) {
+        // Make sure all blocks are marked as free.
+        if (get_alloc(block)) {
+            fprintf(stderr,
+                    "[freelist] (heapcheck %lu) (line %i) Freelist block "
+                    "marked as allocated.\n",
+                    n_calls, line);
+            return HEAP_INVALID;
+        }
+
+        // Check next/prev pointer consistency.
+        if (freelist_find_prev(freelist_find_next(block)) != block) {
+            fprintf(stderr,
+                    "[freelist] (heapcheck %lu) (line %i) Next (%lu) and prev "
+                    "(%lu) pointer inconsistency.\n",
+                    n_calls, line, ptou(freelist_find_next(block)),
+                    ptou(freelist_find_prev(freelist_find_next(block))));
+            return HEAP_INVALID;
+        }
+
+        if (freelist_find_next(freelist_find_prev(block)) != block) {
+            fprintf(stderr,
+                    "[freelist] (heapcheck %lu) (line %i) prev (%lu) and next "
+                    "(%lu) pointer inconsistency.\n",
+                    n_calls, line, ptou(freelist_find_prev(block)),
+                    ptou(freelist_find_next(freelist_find_prev(block))));
+            return HEAP_INVALID;
+        }
+
+        // Make sure that all blocks are within bounds.
+        if (ptou(block) < ptou(heap_start) ||
+            ptou(block) > ptou(mem_heap_hi() - hoffset)) {
+            fprintf(stderr,
+                    "[freelist] (heapcheck %lu) (line %i) Freelist block "
+                    "(0x%lu) address out of bounds (0x%lu, 0x%lu).\n",
+                    n_calls, line, ptou(block), ptou(heap_start),
+                    ptou(mem_heap_hi() - hoffset));
+            return HEAP_INVALID;
+        }
+
+        // Update loop variables.
+        block = freelist_find_next(block);
+        looped = (block == head);
+    }
+
+    return ret_code;
+}
+
+static bool splaytree_checker(int line, size_t n_calls, block_t *tree) {
+   bool ret_code = HEAP_VALID;
+
+   if (tree == NULL)
+       return ret_code;
+
+   if (tree->right != NULL) {
+       size_t size = get_size(tree);
+       size_t rsize = get_size(tree->right);
+
+       if (rsize < size) {
+           fprintf(stderr, "[splay] (heapcheck %lu) (line %i) Block %p of
+           size %lu has right child of smaller size %lu.\n",
+                   n_calls, line, tree, size, rsize);
+           return HEAP_INVALID;
+       }
+
+       if ((rsize == size) && (ptou(tree->right) < ptou(tree))) {
+           fprintf(stderr, "[splay] (heapcheck %lu) (line %i) Block %p of
+           size %lu has right child of same size with smaller address %p.\n",
+                   n_calls, line, tree, size, tree->right);
+           return HEAP_INVALID;
+       }
+   }
+
+   if (tree->left != NULL) {
+       size_t size = get_size(tree);
+       size_t lsize = get_size(tree->left);
+
+       if (lsize > size) {
+           fprintf(stderr, "[splay] (heapcheck %lu) (line %i) Block %p of
+           size %lu has left child of larger size %lu.\n",
+                   n_calls, line, tree, size, lsize);
+           return HEAP_INVALID;
+       }
+
+       if ((lsize == size) && (ptou(tree->left) > ptou(tree))) {
+           fprintf(stderr, "[splay] (heapcheck %lu) (line %i) Block %p of
+           size %lu has left child of same size with larger address %p.\n",
+                   n_calls, line, tree, size, tree->left);
+           return HEAP_INVALID;
+       }
+   }
+
+   if (ptou(tree) < ptou(heap_start) || ptou(tree) > ptou(mem_heap_hi() -
+   hoffset)) {
+       fprintf(stderr,
+           "[splay] (heapcheck %lu) (line %i) Block %p address out of bounds
+           (%p, %p).\n", n_calls, line, tree, heap_start, mem_heap_hi() -
+           hoffset);
+       return HEAP_INVALID;
+   }
+
+   if (seglist_find_bin(tree) <= seglist_small_bins) {
+       fprintf(stderr, "[splay] (heapcheck %lu) (line %i) Block %p size %lu
+       too small for splaytree.\n",
+               n_calls, line, tree, get_size(tree));
+       return HEAP_INVALID;
+   }
+
+   return splaytree_checker(line, n_calls, tree->right) &&
+   splaytree_checker(line, n_calls, tree->left);
+}
+
+size_t splaytree_count(block_t *tree) {
+   if (tree == NULL)
+       return 0;
+
+   size_t count = 0;
+   for (block_t *b = tree; b != NULL; b = b->next_dup)
+       count++;
+
+   return count + splaytree_count(tree->right) + splaytree_count(tree->left);
+}
+
+/**
+ * @brief Check the seglist for consistency.
+ *
+ * The following conditions are checked:
+ * - The number of free blocks in the seglist matches the number of free blocks
+ * in the implicit list.
+ * - Each block is placed in the correct bin relative to its size.
+ * - All conditions of explicit_list_checker are also checked implicitly.
+ *
+ * @note This function calls explicit_list_checker.
+ *
+ * @param[in]  line     The line number from which mm_checkheap was called.
+ * @param[in]  n_calls  The number of times that mm_checkheap was called prior
+ * to this time.
+ * @return HEAP_VALID (true) if no errors detected, HEAP_INVALID otherwise.
+ */
+static bool seglist_checker(int line, size_t n_calls) {
+    bool ret_code = HEAP_VALID;
+    size_t num_free_blocks_explicit = 0;
+
+    for (size_t bin = 0; bin < seglist_size; ++bin) {
+        Check for normal explicit list consistency for each bin.
+        if (bin >= seglist_splay_bins) {
+           //ret_code = explicit_list_checker(line, n_calls,
+           seglist_heads[bin]); ret_code = splaytree_checker(line, n_calls,
+           seglist_heads[bin]); num_free_blocks_explicit +=
+           splaytree_count(seglist_heads[bin]);
+
+        } else {
+            size_t bin_size_upper =
+                (bin < seglist_size - 1) ? seglist_bin_sizes[bin] : SIZE_MAX;
+            size_t bin_size_lower = bin ? seglist_bin_sizes[bin - 1] : 0;
+            if (bin <= seglist_small_bins)
+                bin_size_upper = bin_size_lower = seglist_bin_sizes[bin];
+
+            size_t block_idx = 0;
+            bool looped = false;
+            block_t *b = seglist_heads[bin];
+            while (!looped && b != NULL) {
+                // Check that all blocks in bin are appropriately sized.
+                if (bin <= seglist_small_bins) {
+                    if (get_size(b) != seglist_bin_sizes[bin]) {
+                        fprintf(stderr,
+                                "(heapcheck %lu) (line %i) (small) Block %p size "
+                                "%lu does not match small bin size %lu.\n",
+                                n_calls, line, b, get_size(b),
+                                seglist_bin_sizes[bin]);
+                        print_seglist();
+                        return HEAP_INVALID;
+                    }
+                } else if (get_size(b) > bin_size_upper ||
+                        get_size(b) <= bin_size_lower) {
+                    fprintf(stderr,
+                            "(heapcheck %lu) (line %i) (bin %lu block %lu) Block "
+                            "size (%lu) not in bin range [%lu, %lu].\n",
+                            n_calls, line, bin, block_idx, get_size(b),
+                            bin_size_lower, bin_size_upper);
+                    print_seglist();
+                    return HEAP_INVALID;
+                }
+
+                // Check that bin selection for the block is consistent.
+                if (seglist_find_bin(b) != bin) {
+                    fprintf(stderr,
+                            "(heapcheck %lu) (line %i) (bin %lu block %lu) Block "
+                            "bin is %lu but seglist_find_bin returned %lu.\n",
+                            n_calls, line, bin, block_idx, bin,
+                            seglist_find_bin(b));
+                    print_seglist();
+                    return HEAP_INVALID;
+                }
+
+                if (bin <= seglist_small_bins && find_next(b) &&
+                    !get_prev_small(find_next(b))) {
+                    fprintf(stderr,
+                            "(heapcheck %lu) (line %i) (small blocks) Block %p "
+                            "next block has prev_small bit set to 0.\n",
+                            n_calls, line, b);
+                    print_seglist();
+                    return HEAP_INVALID;
+                }
+
+                b = freelist_find_next(b);
+                looped = (b == seglist_heads[bin]);
+                block_idx++;
+                num_free_blocks_explicit++;
+            }
+        }
+    }
+
+    // Count the number of free blocks from view of implicit list.
+    size_t num_free_blocks_implicit = 0;
+    for (block_t *block = heap_start; get_size(block) > 0;
+         block = find_next(block))
+        if (!get_alloc(block))
+            num_free_blocks_implicit++;
+
+    if (num_free_blocks_implicit != num_free_blocks_explicit) {
+        fprintf(stderr,
+                "(heapcheck %lu) (line %i) Inconsistent number of free blocks "
+                "(implicit %lu, explicit %lu).\n",
+                n_calls, line, num_free_blocks_implicit,
+                num_free_blocks_explicit);
+        return HEAP_INVALID;
+    }
+
+    return ret_code;
+}
+
+/**
+ * @brief Check that the heap is valid. Useful for debugging.
+ *
+ * @param[in]  line  Line number from which `mm_checkheap` was called.
+ * @return `false` if a heap error is detected, `false` otherwise.
+ */
+bool mm_checkheap(int line) {
+    //// It's mildly helpful to track how many times this function has been
+    ///called / -- this gives us a heuristic sense for how far into the
+    ///program's runtime / an error occurred.
+    // static size_t n_calls = 1;
+    size_t n_calls = 0;
+
+    //--------------------------------------------------
+    // Check generic heap invariants.
+    //--------------------------------------------------
+    bool ret_code = HEAP_VALID;
+
+    // Check for prologue block.
+    block_t *start = mem_heap_lo();
+    if (get_size(start) && !get_prev_alloc(find_next(start))) {
+        fprintf(stderr, "(heapcheck %lu) (line %i) No prologue boundary.\n",
+                n_calls, line);
+        return HEAP_INVALID;
+    }
+
+    // Check for epilogue block.
+    block_t *end = mem_heap_hi() - hoffset;
+    if (!get_alloc(end) || get_size(end)) {
+        fprintf(stderr, "(heapcheck %lu) (line %i) No epilogue boundary.\n",
+                n_calls, line);
+        return HEAP_INVALID;
+    }
+
+    if (heap_start == NULL) {
+        fprintf(stderr,
+                "(heapcheck %lu) (line %i) Heap has not been initialized "
+                "(heap_start is NULL).\n",
+                n_calls, line);
+        return HEAP_INVALID;
+    }
+
+    //--------------------------------------------------
+    // Check list implementation-specific heap invariants.
+    //--------------------------------------------------
+    // Check implicit list for consistency.
+    if (implicit_list_checker(line, n_calls) == HEAP_INVALID)
+        return HEAP_INVALID;
+
+    // Check explicit list for consistency.
+    if (seglist_checker(line, n_calls) == HEAP_INVALID)
+        return HEAP_INVALID;
+
+    n_calls++;
+    return ret_code;
+}
+
+/**
+ * @brief Print a representation of the heap to stdout.
+ *
+ * Used for debugging purposes only.
+ *
+ * @todo Define a dbg macro for this.
+ */
+void print_heap(void) {
+    for (block_t *block = heap_start; get_size(block) > 0;
+         block = find_next(block)) {
+        printf(
+            "(block %p) alloc %i | prev alloc %i | prev small %i | size %lu\n",
+            block, get_alloc(block), get_prev_alloc(block),
+            get_prev_small(block), get_size(block));
+    }
 }
 
 /**
@@ -1156,7 +1781,7 @@ bool mm_init(void) {
  * @param[in]  size  The size in bytes of the requested block.
  * @return Pointer to the first byte of the requested block.
  */
-void *mm_malloc(size_t size) {
+void *malloc(size_t size) {
     dbg_requires(mm_checkheap(__LINE__));
 
     size_t asize;      // Adjusted block size
@@ -1176,6 +1801,7 @@ void *mm_malloc(size_t size) {
 
     // Adjust block size to include overhead and to meet alignment requirements
     asize = round_up(size + wsize, dsize);
+    asize = max(asize, min_block_size);
 
     // Search the free list for a fit
     block = find_fit(asize);
@@ -1213,15 +1839,26 @@ void *mm_malloc(size_t size) {
 }
 
 /**
- * @brief Frees a previously allocated (by mm_malloc) block of memory.
+ * @todo
+ */
+bool is_in_heap(block_t *block) {
+    for (block_t *b = heap_start; get_size(b) > 0; b = find_next(b)) {
+        if (b == block)
+            return true;
+    }
+    return false;
+}
+
+/**
+ * @brief Frees a previously allocated (by malloc) block of memory.
  *
- * @note Will fail if the pointer is not one that was returned by mm_malloc at some
+ * @note Will fail if the pointer is not one that was returned by malloc at some
  * previous point.
  *
  * @param[in]  bp  Pointer to the first byte of a block of memory returned by
- * mm_malloc.
+ * malloc.
  */
-void mm_free(void *bp) {
+void free(void *bp) {
     dbg_requires(mm_checkheap(__LINE__));
 
     if (bp == NULL)
@@ -1239,7 +1876,7 @@ void mm_free(void *bp) {
     // Update freelist
     seglist_insert(block);
 
-    // Try to coalesce the block with its neighbors
+    //// Try to coalesce the block with its neighbors
     block = coalesce_block(block);
 
     dbg_ensures(mm_checkheap(__LINE__));
@@ -1256,25 +1893,25 @@ void mm_free(void *bp) {
  * @param[in]  size  The new size of the block.
  * @return Pointer to the new, resized block.
  */
-void *mm_realloc(void *ptr, size_t size) {
+void *realloc(void *ptr, size_t size) {
     block_t *block = payload_to_header(ptr);
     size_t copysize;
     void *newptr;
 
     // If size == 0, then free block and return NULL
     if (size == 0) {
-        mm_free(ptr);
+        free(ptr);
         return NULL;
     }
 
-    // If ptr is NULL, then equivalent to mm_malloc
+    // If ptr is NULL, then equivalent to malloc
     if (ptr == NULL)
-        return mm_malloc(size);
+        return malloc(size);
 
     // Otherwise, proceed with reallocation
-    newptr = mm_malloc(size);
+    newptr = malloc(size);
 
-    // If mm_malloc fails, the original block is left untouched
+    // If malloc fails, the original block is left untouched
     if (newptr == NULL)
         return NULL;
 
@@ -1285,20 +1922,20 @@ void *mm_realloc(void *ptr, size_t size) {
     memcpy(newptr, ptr, copysize);
 
     // Free the old block
-    mm_free(ptr);
+    free(ptr);
 
     return newptr;
 }
 
 /**
- * @brief Call mm_malloc and initialize the bits of the allocated block to zero.
+ * @brief Call malloc and initialize the bits of the allocated block to zero.
  *
  * @param[in]  elements  Number of elements that will be contained in the
  * allocated block.
  * @param[in]  size      The number of bytes per element.
  * @return Pointer to the zero-initialized, allocated block.
  */
-void *mm_calloc(size_t elements, size_t size) {
+void *calloc(size_t elements, size_t size) {
     void *bp;
     size_t asize = elements * size;
 
@@ -1309,7 +1946,7 @@ void *mm_calloc(size_t elements, size_t size) {
         // Multiplication overflowed
         return NULL;
 
-    bp = mm_malloc(asize);
+    bp = malloc(asize);
     if (bp == NULL)
         return NULL;
 
@@ -1318,391 +1955,3 @@ void *mm_calloc(size_t elements, size_t size) {
 
     return bp;
 }
-
-/*
- * ---------------------------------------------------------------------------
- *                        BEGIN DEBUGGING FUNCTIONS
- * ---------------------------------------------------------------------------
- */
-
-/**
- * @brief Print a representation of the heap to stdout.
- *
- * Used for debugging purposes only.
- */
-void print_heap(void) {
-    for (block_t *block = heap_start; get_size(block) > 0;
-         block = find_next(block)) {
-        printf(
-            "(block %p) alloc %i | prev alloc %i | prev small %i | size %lu\n",
-            block, get_alloc(block), get_prev_alloc(block),
-            get_prev_small(block), get_size(block));
-    }
-}
-
-/**
- * @brief Print a representation of the freelist.
- *
- * Only for debugging purposes.
- *
- * @param[in]  head  Pointer to the head of the freelist to print.
- */
-void print_freelist(block_t *head) {
-    block_t *b = head;
-    bool looped = false;
-    while (!looped && b != NULL) {
-        if (b)
-            printf("%p (%lu) (%lu) <-> ", b, seglist_find_bin(b), get_size(b));
-        else
-            printf("NULL <-> ");
-
-        b = freelist_find_next(b);
-        looped = (b == head);
-    }
-}
-
-/**
- * @brief Print a representation of the seglist.
- *
- * Only for debugging purposes.
- *
- * @note Calls print_freelist implicitly.
- */
-void print_seglist(void) {
-    printf("\n");
-    for (size_t bin = 0; bin < seglist_size; ++bin) {
-        if (bin <= seglist_small_bins)
-            printf("(small) ");
-        else
-            printf("(  seg) ");
-
-        printf("bin %lu (%lu):\t", bin,
-               (bin < seglist_size - 1) ? seglist_bin_sizes[bin] : SIZE_MAX);
-        print_freelist(seglist_heads[bin]);
-        printf("\n");
-    }
-}
-
-/**
- * @brief Check a block in the implicit list and return a code indicating its
- * status.
- *
- * Corresponding codes are returned depending on which (if any) of the required
- * conditions are violated. See `implicit_list_checker` for more details.
- *
- * @param[in]  block  Pointer to the block to check.
- * @return Code BLOCK_VALID (zero-value) if no error is detected. Otherwise, a
- * nonzero value code is returned indicating the detected error.
- */
-code_t check_block_validity(block_t *block) {
-    code_t code = BLOCK_VALID;
-
-    if ((word_t)header_to_payload(block) % dsize)
-        code |= ADDRESS_ALIGNMENT_ERROR;
-
-    if (ptou(block) < ptou(mem_heap_lo()) ||
-        ptou(block) > ptou(mem_heap_hi() - hoffset))
-        code |= OUT_OF_BOUNDS_ERROR;
-
-    if (get_size(block) < min_block_size)
-        code |= SIZE_ERROR;
-
-    return code;
-}
-
-/**
- * @brief Check that the implicit list of the heap is consistent.
- *
- * Will check the following:
- * - That the payload address is aligned properly.
- * - That the block address is within heap bounds.
- * - That the block is at least as big as `min_block_size`.
- * - That the header and footer are consistent.
- *
- * @param[in]  line     Line number from which mm_checkheap was called.
- * @return HEAP_VALID (true) if no error is detected, HEAP_INVALID (false)
- * otherwise.
- */
-bool implicit_list_checker(int line) {
-    bool ret_code = HEAP_VALID;
-    size_t block_idx = 0;
-    bool alloc_prev = true;
-    bool small_prev = true;
-
-    for (block_t *block = heap_start; get_size(block) > 0;
-         block = find_next(block)) {
-        // Check if block is valid.
-        code_t code = check_block_validity(block);
-        if (code & ADDRESS_ALIGNMENT_ERROR) {
-            fprintf(stderr,
-                    "[implicit] (line %i) (block %p) Address "
-                    "misalignment %p.\n",
-                    line, block, header_to_payload(block));
-            ret_code = HEAP_INVALID;
-        }
-        if (code & OUT_OF_BOUNDS_ERROR) {
-            fprintf(stderr,
-                    "[implicit] (line %i) (block %p) Block "
-                    "out of heap bounds.\n",
-                    line, block);
-            ret_code = HEAP_INVALID;
-        }
-        if (code & SIZE_ERROR) {
-            fprintf(stderr,
-                    "[implicit] (line %i) (block %p) Size %lu "
-                    "is smaller than minimum required block size %lu\n",
-                    line, block, get_size(block), min_block_size);
-            ret_code = HEAP_INVALID;
-        }
-
-        // Check that prev_alloc bit is correct.
-        if (block_idx && alloc_prev != get_prev_alloc(block)) {
-            fprintf(stderr,
-                    "[implicit] (line %i) (block %p) Inconsistent "
-                    "prev_alloc bit (blocks %lu, %lu).\n",
-                    line, block, block_idx - 1, block_idx);
-            ret_code = HEAP_INVALID;
-        }
-
-        // Check that prev_small bit is correct.
-        if (block_idx && small_prev != get_prev_small(block)) {
-            fprintf(stderr,
-                    "[implicit] (line %i) (block %p) Inconsistent "
-                    "prev_small bit (blocks %lu, %lu).\n",
-                    line, block, block_idx - 1, block_idx);
-            ret_code = HEAP_INVALID;
-        }
-
-        // Coalescing check.
-        if (block_idx && !alloc_prev && !get_alloc(block)) {
-            fprintf(
-                stderr,
-                "[implicit] (line %i) (block %p) Coalesce "
-                "failed -- found consecutive free blocks (blocks %lu, %lu).\n",
-                line, block, block_idx - 1, block_idx);
-            ret_code = HEAP_INVALID;
-        }
-
-        // Update loop variables.
-        block_idx++;
-        alloc_prev = get_alloc(block);
-        small_prev = (get_size(block) <= seglist_bin_sizes[seglist_small_bins]);
-    }
-
-    return ret_code;
-}
-
-/**
- * @brief Check the blocks in the explicit freelist for consistency.
- *
- * The following conditions are checked:
- * - All blocks are marked as free.
- * - The next/prev pointers are consistent i.e. the prev pointer of the next
- * block is a pointer to this block.
- * - The addresses of all free blocks are within bounds.
- *
- * @param[in]  line     Line number from which mm_checkheap was called.
- * @return HEAP_VALID (true) if no errors detected, HEAP_INVALID (false)
- * otherwise.
- */
-static bool explicit_list_checker(int line, block_t *head) {
-    bool ret_code = HEAP_VALID;
-    bool looped = false;
-    block_t *block = head;
-
-    while (!looped && block != NULL) {
-        // Make sure all blocks are marked as free.
-        if (get_alloc(block)) {
-            fprintf(stderr,
-                    "[freelist] (line %i) Freelist block "
-                    "marked as allocated.\n",
-                    line);
-            return HEAP_INVALID;
-        }
-
-        // Check next/prev pointer consistency.
-        if (freelist_find_prev(freelist_find_next(block)) != block) {
-            fprintf(stderr,
-                    "[freelist] (line %i) Next (%lu) and prev "
-                    "(%lu) pointer inconsistency.\n",
-                    line, ptou(freelist_find_next(block)),
-                    ptou(freelist_find_prev(freelist_find_next(block))));
-            return HEAP_INVALID;
-        }
-
-        if (freelist_find_next(freelist_find_prev(block)) != block) {
-            fprintf(stderr,
-                    "[freelist] (line %i) prev (%lu) and next "
-                    "(%lu) pointer inconsistency.\n",
-                    line, ptou(freelist_find_prev(block)),
-                    ptou(freelist_find_next(freelist_find_prev(block))));
-            return HEAP_INVALID;
-        }
-
-        // Make sure that all blocks are within bounds.
-        if (ptou(block) < ptou(heap_start) ||
-            ptou(block) > ptou(mem_heap_hi() - hoffset)) {
-            fprintf(stderr,
-                    "[freelist] (line %i) Freelist block "
-                    "(0x%lu) address out of bounds (0x%lu, 0x%lu).\n",
-                    line, ptou(block), ptou(heap_start),
-                    ptou(mem_heap_hi() - hoffset));
-            return HEAP_INVALID;
-        }
-
-        // Update loop variables.
-        block = freelist_find_next(block);
-        looped = (block == head);
-    }
-
-    return ret_code;
-}
-
-/**
- * @brief Check the seglist for consistency.
- *
- * The following conditions are checked:
- * - The number of free blocks in the seglist matches the number of free blocks
- * in the implicit list.
- * - Each block is placed in the correct bin relative to its size.
- * - All conditions of explicit_list_checker are also checked implicitly.
- *
- * @note This function calls explicit_list_checker.
- *
- * @param[in]  line     The line number from which mm_checkheap was called.
- * @return HEAP_VALID (true) if no errors detected, HEAP_INVALID otherwise.
- */
-static bool seglist_checker(int line) {
-    bool ret_code = HEAP_VALID;
-    size_t num_free_blocks_explicit = 0;
-
-    for (size_t bin = 0; bin < seglist_size; ++bin) {
-        size_t bin_size_upper =
-            (bin < seglist_size - 1) ? seglist_bin_sizes[bin] : SIZE_MAX;
-        size_t bin_size_lower = bin ? seglist_bin_sizes[bin - 1] : 0;
-        if (bin <= seglist_small_bins)
-            bin_size_upper = bin_size_lower = seglist_bin_sizes[bin];
-
-        size_t block_idx = 0;
-        bool looped = false;
-        block_t *b = seglist_heads[bin];
-        while (!looped && b != NULL) {
-            // Check that all blocks in bin are appropriately sized.
-            if (bin <= seglist_small_bins) {
-                if (get_size(b) != seglist_bin_sizes[bin]) {
-                    fprintf(stderr,
-                            "(line %i) (small) Block %p size "
-                            "%lu does not match small bin size %lu.\n",
-                            line, b, get_size(b), seglist_bin_sizes[bin]);
-                    print_seglist();
-                    return HEAP_INVALID;
-                }
-            } else if (get_size(b) > bin_size_upper ||
-                       get_size(b) <= bin_size_lower) {
-                fprintf(stderr,
-                        "(line %i) (bin %lu block %lu) Block "
-                        "size (%lu) not in bin range [%lu, %lu].\n",
-                        line, bin, block_idx, get_size(b), bin_size_lower,
-                        bin_size_upper);
-                print_seglist();
-                return HEAP_INVALID;
-            }
-
-            // Check that bin selection for the block is consistent.
-            if (seglist_find_bin(b) != bin) {
-                fprintf(stderr,
-                        "(line %i) (bin %lu block %lu) Block "
-                        "bin is %lu but seglist_find_bin returned %lu.\n",
-                        line, bin, block_idx, bin, seglist_find_bin(b));
-                print_seglist();
-                return HEAP_INVALID;
-            }
-
-            if (bin <= seglist_small_bins && find_next(b) &&
-                !get_prev_small(find_next(b))) {
-                fprintf(stderr,
-                        "(line %i) (small blocks) Block %p "
-                        "next block has prev_small bit set to 0.\n",
-                        line, b);
-                print_seglist();
-                return HEAP_INVALID;
-            }
-
-            b = freelist_find_next(b);
-            looped = (b == seglist_heads[bin]);
-            block_idx++;
-            num_free_blocks_explicit++;
-        }
-    }
-
-    // Count the number of free blocks from view of implicit list.
-    size_t num_free_blocks_implicit = 0;
-    for (block_t *block = heap_start; get_size(block) > 0;
-         block = find_next(block))
-        if (!get_alloc(block))
-            num_free_blocks_implicit++;
-
-    if (num_free_blocks_implicit != num_free_blocks_explicit) {
-        fprintf(stderr,
-                "(line %i) Inconsistent number of free blocks "
-                "(implicit %lu, explicit %lu).\n",
-                line, num_free_blocks_implicit, num_free_blocks_explicit);
-        return HEAP_INVALID;
-    }
-
-    return ret_code;
-}
-
-/**
- * @brief Check that the heap is valid. Useful for debugging.
- *
- * @param[in]  line  Line number from which `mm_checkheap` was called.
- * @return `false` if a heap error is detected, `false` otherwise.
- */
-bool mm_checkheap(int line) {
-    //--------------------------------------------------
-    // Check generic heap invariants.
-    //--------------------------------------------------
-    bool ret_code = HEAP_VALID;
-
-    // Check for prologue block.
-    block_t *start = mem_heap_lo();
-    if (get_size(start) && !get_prev_alloc(find_next(start))) {
-        fprintf(stderr, "(line %i) No prologue boundary.\n", line);
-        return HEAP_INVALID;
-    }
-
-    // Check for epilogue block.
-    block_t *end = mem_heap_hi() - hoffset;
-    if (!get_alloc(end) || get_size(end)) {
-        fprintf(stderr, "(line %i) No epilogue boundary.\n", line);
-        return HEAP_INVALID;
-    }
-
-    if (heap_start == NULL) {
-        fprintf(stderr,
-                "(line %i) Heap has not been initialized "
-                "(heap_start is NULL).\n",
-                line);
-        return HEAP_INVALID;
-    }
-
-    //--------------------------------------------------
-    // Check list implementation-specific heap invariants.
-    //--------------------------------------------------
-    // Check implicit list for consistency.
-    if (implicit_list_checker(line) == HEAP_INVALID)
-        return HEAP_INVALID;
-
-    // Check explicit list for consistency.
-    if (seglist_checker(line) == HEAP_INVALID)
-        return HEAP_INVALID;
-
-    return ret_code;
-}
-
-/*
- * ---------------------------------------------------------------------------
- *                        END DEBUGGING FUNCTIONS
- * ---------------------------------------------------------------------------
- */

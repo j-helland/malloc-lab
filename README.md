@@ -1,145 +1,35 @@
 # Implementation of `malloc` in C for CMU 15213
 
-A 64-bit struct-based segmented free list memory allocator.
-Provides `malloc`, `free`, `calloc`, and `realloc` implementations.
+This branch provides an experimental splay tree implementation to manage larger block sizes.
+I unfortunately didn't have time to fully explore tree-based free block managers to my satisfaction.
 
-An experimental branch using splay-trees for managing certain memory blocks is also available.
+### **Why search trees?**
+The idea for using BSTs to manage free blocks is that best-fit allocation policies can be significantly sped-up to O(log n) time instead of O(n) time with the standard freelist.
+If we restrict ourslves to only using BSTs for sufficiently large free blocks, we can be clever and cram all of the memory overhead required for the data structure into the memory blocks themselves.
+With the right coalescing policy and usage patterns, we can expect lots of relatively large free blocks and thus the O(log n) search time becomes important.
 
-### **WARNING**
-This code will not compile as-is. It was written to interface with a larger test harness that includes memory emulation. In particular, the heap is simulated e.g. functions like `mem_sbrk` exist in place of standard `sbrk`.
-Descriptions of these functions are provided in [`memlib.h`](./memlib.h), which should provide enough context to port this code to the canonical C UNIX functions if desired.
+A best-fit policy is desirable because it reduces the external fragmentation introduced by splitting blocks that are too large -- this means that we can theoretically get better memory utilization.
 
-# Organization
+This could probably be further optimized with the right tree balancing (e.g. min heap).
 
-### [`mm.c`](./mmc)
-1. Constants, structs, globals, etc.
+### **Why splay trees?**
+Splay trees are a really cool data structure that adaptively specializes itself towards its usage patterns.
+In this sense, one might even consider a splay tree to be a primitive form of active learning.
 
-2. Helper functions. These operate on a specific subcomponent of the heap
-   e.g. seglist_insert.
-  a. Math & misc b. Get data: access metadata from a block.
-  c. Set data: write metadata to a block.
-  d. Basic search: find blocks matching various specifications.
-  e. Freelist helpers: functions that interact exclusively with an
-     individual freelist data structure.
-  f. Seglist helpers: functions that interact with the entire segmented
-     list data structure.
+A splay tree implements a certain balancing policy based on repeated access.
+In particular, the idea of the splay tree is to re-balance the tree so that the most frequent accesses become the fastest.
+Practically, this means that if we use a splay-tree to manage free blocks, then repeated allocations of the same size will get faster and faster even though we use a best-fit policy.
 
-3. Primary heap routines. These operate on the entire heap in some way e.g.
-   mm_malloc, mm_free.
+In other words, if we know that usage patterns for our dynamic allocator request many similarly sized blocks in a row, then we can optimize for this situation using splay trees.
+Unfortunately, the traces used by the test harness include many other usage patterns that do not fit this use-case very well, so I did not find an overall performance boost with this current implementation.
 
-4. Debugging functions. These include heap checker functions and printing
-   functions that are handy in gdb e.g. print_heap.
-
-### [`memlib.h`](./memlib.h)
-
-A bare header that only exists to provide descriptions of the heap simulator functions so that this code can be ported over to use canonical C UNIX functions instead if so desired.
-
-# Documentation
-You'll find that most of the standard tricks for malloc performance have been
-implemented here e.g. segregated freelists, small memory bins with footer-less blocks, 
-free block coalescing, mixture of FIFO and LIFO policies depending on block sizes.
-
- This malloc implementation organizes blocks according to their sizes via a
- segregated list. The segregated list itself contains bins corresponding to
- "small" blocks and "large" blocks. Blocks within a small bin all have the
- same size and are strung together by a singly-linked list -- this
- means that minimal overhead is required. Large bins contain blocks of varying
- sizes within some pre-determined range and are thus connected together via a
- doubly-linked, circular list. By reserving this overhead only for larger
- blocks, we minimize wasted space since a sufficiently large block will
- already have enough capacity in its payload for the next/prev list pointers.
-
- Pictorially, the segregated list has the following bin structure:
- ```
-  ---- ---- ----       ---- -----       -------
- | 16 | 32 | 40 | ... | 64 | 128 | ... | 16384 |
-  ---- ---- ----       ---- -----       -------
- small <-----------------large---------------->
- ```
-
- Even though only the first bin is marked as "small", the size 32 bin is de
- facto small as well due to the 16-byte address alignment requirement. We
- could actually do much better in terms of utilization if we removed the
- alignment constraint for small bins - there are many 24 byte allocations, for
- example. However, the alignment requirement of this assignment means that it
- only makes sense to have a single small bin.
-
- Starting at bin size 32, we increase in size by increments of 8 up to size
- 64, at which point we begin doubling the bin size at each step. This is
- because of the roughly power-law distributed allocation sizes that we see in
- practice across all traces. We want to have a fairly fine level of
- granularity for small bins, whereas larger allocation sizes will occur
- relatively rarely.
-
- Within the small bin, the blocks follow a typical singly-linked list
- structure. Each node has one size.
- Our insertion policy here is at the head i.e. O(1). Removal can happen
- anywhere i.e. O(n).
- ```
-  ----      ----             ----
- | 16 | -> | 16 | -> ... -> | 16 | -> NULL
-  ----      ----             ----
-```
-
- The large bins are doubly linked and circular. Each node has a varying size.
- The circularity is an implementation convenience - it allows for fewer
- global variables if we want to do things like tail insertion.
- Our insertion policy is slightly more complicated here:
- - If a block is small enough, we insert at the head.
- - If a block is large enough, we insert at the tail.
- Experimentally, I found that head insertion for the 32-64 sized bins and
- tail insertion for the 128-16384 sized bins performs pretty well in terms of
- throughput while not sacrificing too much utilization.
- ```
-           ----       ----               ----
- tail <-> |    | <-> |    | <-> ... <-> |    | <-> head
-           ----       ----               ----
-           head                          tail
-```
-
- To find a block fit when calling malloc, I use a first-fit policy. Starting
- at the smallest bin size with sufficient capacity for the request, the
- search traverses through the freelist starting at the head, moving up to
- the next bin if no match is found.
-
- Upon finding a match, we split the block down to the requested size (plus
- overhead), adding the split off block back into the seglist.
-
- O(1) coalescing is implemented with an immediate-coalesce policy, meaning
- that we coalesce immediately upon a free operation.
-
-
-### **OPTIMIZATIONS**
- Here I describe in a bulleted fashion the most significant performance
- improvements. Much of this information is contained in the above
- overview of the system.
-
- - Segmented list of freelists. This approximates a best fit policy well
-   enough that we can get away with a fast first-fit policy for finding
-   free blocks. This improves both utilization and throughput.
-
- - No footers for small blocks, instead we use a bit in the header that
-   indicates the allocations status of the previous block. This improves
-   utilization.
-
- - Singly linked list for small blocks i.e. only the header and one
-   next pointer. This improves utilization.
-
- - A mixture of LIFO and FIFO insertion policies in large bins depending
-   on the size of the bin. This increases throughput with a negligible
-   decrease in utilization.
-
-### **FUTURE IMPROVEMENTS**
- - In theory, a search tree would help with utilization for bins that
-   have high entropy in their distribution of block sizes. This tends
-   to be the case for the largest bins (recall that the allocation
-   sizes tend to follow a power-law distribution and the large bins
-   exist in the tail regime of this distribution). This would allow
-   an efficient best-fit policy for these bins.
-
-### **FAILED EXPERIMENTS**
- - Splay trees to order blocks by size did not seem to help. In fact,
-   utilization did not seem to improve while throughput significantly
-   decreased. I suspect this was due to the overhead of the splay
-   operation after every insertion and deletion.
-   Note: I used a best-fit policy for the splay tree.
+### **Possible improvements**
+- I my implementation keeps the same segregated list bin ranges that worked well for the freelists and uses splay trees to manage the largest segments. 
+    It might work better to increase the bin ranges for the splay tree managed segments so that each tree manages a larger range of block sizes.
+    That way, the splaying operation over time will roughly approximate the more fine-grained binning scheme.
+- Deciding when to splay the tree needs further consideration. 
+    In my current implementation, the tree splays both on insertion and deletion, meaning that splays happen on malloc and free calls.
+    Prioritizing splays on allocations might help.
+- Deciding when we actually need the best-fit policy needs more thought. 
+    Can we monitor external fragmentation and adapt our fitting policy accordingly? 
+    This should help with only using the algorithmic overhead of the splay tree when we actually need it.
